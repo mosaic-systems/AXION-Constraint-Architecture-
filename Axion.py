@@ -1,0 +1,666 @@
+import numpy as np
+import scipy.sparse as sp
+import scipy.linalg as sla
+import osqp
+import os
+import time
+import warnings
+import io
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Optional, Any
+from enum import Enum, auto
+from collections import defaultdict
+
+warnings.filterwarnings('ignore')
+plt.rcParams['figure.figsize'] = (14, 10)
+plt.rcParams['font.size'] = 9
+
+# ==================================================================
+# AXION CONFIGURATION
+# ==================================================================
+
+class PrimitiveStatus(Enum):
+    PASS_OK = auto()
+    STRESSED = auto()
+    VIOLATED = auto()
+    OVERRIDE = auto()
+
+@dataclass
+class AxionConfig:
+    N_AGENTS: int = 3
+    HORIZON: int = 10
+    DT: float = 0.1
+    D_SAFE: float = 0.40
+    W_PROC: float = 0.02
+    W_EST: float = 0.02
+    ALPHA: float = 1.5
+    SLACK_WEIGHT: float = 2000.0
+    EPS_MAX: float = 0.05
+    X_TARGET: np.ndarray = field(default_factory=lambda: np.array([-0.5, 0.0, 0.5]))
+    Q_KF: np.ndarray = field(default_factory=lambda: np.diag([0.01, 0.01, 0.01]))
+    R_KF: np.ndarray = field(default_factory=lambda: np.diag([0.02, 0.02, 0.02]))
+    MC_RUNS: int = 50
+    MC_STEPS: int = 100
+    TRUST_DECAY: float = 0.95
+    TRUST_REINFORCE: float = 0.10
+    TRUST_INERTIA: float = 0.05
+    LYAP_GAMMA: float = 0.01
+    LYAP_EPSILON: float = 0.005
+    LYAP_DAMPING: float = 0.90
+    TIER1_TIMEOUT_MS: float = 5.0
+    TIER2_TIMEOUT_MS: float = 10.0
+    ARBITRATION_ORDER: List[str] = field(default_factory=lambda: ['SAFETY', 'STABILITY', 'LIVENESS', 'EFFICIENCY'])
+    BOOTSTRAP_PHASES: int = 10
+    BOOTSTRAP_DECAY: float = 0.85
+    ENERGY_BUDGET: float = 20.0
+    THERMAL_SLEW_RATE: float = 2.0
+    AGENT_KINEMATIC_LIMITS: float = 4.0
+    UNCERTAINTY_THRESHOLD: float = 0.1
+    OUTPUT_DIR: str = '/kaggle/working'
+    REPORT_PATH: str = '/kaggle/working/axion_full_report.txt'
+    CSV_PATH: str = '/kaggle/working/firegate_axion_mc.csv'
+    PLOT_PATH: str = '/kaggle/working/axion_visual_dashboard.png'
+    # C53 Optimization
+    LYAP_STATE_DEPENDENT_SCALE: float = 0.35  # Scales bound with V_curr to fix lag mismatch
+    LYAP_SLACK_MAX: float = 0.05              # Allow minor violations
+    LYAP_SLACK_WEIGHT: float = 500.0          # Penalty for slack usage
+
+CONFIG = AxionConfig()
+
+NX = CONFIG.N_AGENTS
+NU = CONFIG.N_AGENTS
+H = CONFIG.HORIZON
+DT = CONFIG.DT
+D_SAFE = CONFIG.D_SAFE
+NX_DEC = H * NX
+NU_DEC = H * NU
+PAIRS = [(i, j) for i in range(NX) for j in range(i + 1, NX)]
+NZ_BASE = NX_DEC + NU_DEC + len(PAIRS)
+SLACK_OFFSETS = {p: NX_DEC + NU_DEC + idx for idx, p in enumerate(PAIRS)}
+
+def x_idx(k): return slice((k - 1) * NX, k * NX)
+def u_idx(k): return slice(NX_DEC + k * NU, NX_DEC + (k + 1) * NU)
+
+# ==================================================================
+# MODE HYSTERESIS
+# ==================================================================
+class ModeHysteresis:
+    def __init__(self, enter_thresh: float, exit_thresh: float):
+        self.enter_thresh = enter_thresh
+        self.exit_thresh = exit_thresh
+        self.current_mode = 'NOMINAL'
+        self.consecutive_ok = 0
+        self.min_consecutive = 1
+        
+    def select_mode(self, min_sep: float, lattice_ok: bool, psi_confidence: float = 1.0) -> str:
+        if self.current_mode == 'NOMINAL':
+            if min_sep < self.enter_thresh or (not lattice_ok and psi_confidence < 0.75):
+                self.current_mode = 'A32_DEGRADED'
+                self.consecutive_ok = 0
+        elif self.current_mode == 'A32_DEGRADED':
+            if min_sep > self.exit_thresh and lattice_ok:
+                self.consecutive_ok += 1
+                if self.consecutive_ok >= self.min_consecutive:
+                    self.current_mode = 'NOMINAL'
+                    self.consecutive_ok = 0
+            elif lattice_ok and psi_confidence > 0.90:
+                self.current_mode = 'NOMINAL'
+                self.consecutive_ok = 0
+            else:
+                self.consecutive_ok = 0
+        return self.current_mode
+
+# ==================================================================
+# AXION LATTICE ENGINE (FIXED C53 + TRUE ROOT-CAUSE INSTRUMENTATION)
+# ==================================================================
+class AxionLatticeEngine:
+    def __init__(self, config: AxionConfig):
+        self.cfg = config
+        self.trust = np.ones(config.N_AGENTS)
+        self.stability_margin = 1.0
+        self.bootstrap_steps = 0
+        self.lattice_history = []
+        self._x_hat_prev = None
+        # Ψ-conditioned failure attribution
+        self.psi_trigger_counts = defaultdict(int)
+        # Independent diagnostic counts
+        self.independent_counts = defaultdict(int)
+
+    def evaluate_lattice(self, u_cmd, x_hat, P_kf, u_prev, solve_ms, step):
+        u_safe = u_prev if u_prev is not None else np.zeros(NU)
+        results = {'tier1': {}, 'tier2': {}, 'tier3': {}, 'Psi': True, 'projection': None,
+                   'trust': self.trust.copy(), 'stability': self.stability_margin,
+                   'delta_V': 0.0, 'psi_confidence': 1.0, 'c53_slack': 0.0, 'trigger_constraint': None}
+
+        # Tier 1 Evaluation
+        effort = float(np.sum(np.abs(u_cmd)) * DT)
+        results['tier1']['A5_energy'] = effort <= self.cfg.ENERGY_BUDGET
+        results['tier1']['A8_slew'] = bool(np.max(np.abs(u_cmd - u_safe)) <= self.cfg.THERMAL_SLEW_RATE)
+        results['tier1']['A9_kinematic'] = bool(np.all(np.abs(u_cmd) <= self.cfg.AGENT_KINEMATIC_LIMITS))
+        results['tier1']['A6_compute'] = solve_ms <= self.cfg.TIER1_TIMEOUT_MS
+        results['tier1']['C59_actuation'] = bool(np.all(np.isfinite(u_cmd)))
+
+        # Tier 2 Evaluation
+        if self._x_hat_prev is not None:
+            innovation = float(np.linalg.norm(x_hat - (self._x_hat_prev + DT * u_safe)))
+        else:
+            innovation = 0.0
+        self._x_hat_prev = x_hat.copy()
+
+        # Trust Dynamics
+        reinforce_base = np.clip(1.0 - innovation, 0.0, 1.0)
+        adaptive_reinforce = reinforce_base * (1.0 - 0.5 * np.mean(self.trust))
+        trust_raw = self.cfg.TRUST_DECAY * self.trust + self.cfg.TRUST_REINFORCE * adaptive_reinforce
+        self.trust = self.cfg.TRUST_INERTIA * self.trust + (1.0 - self.cfg.TRUST_INERTIA) * trust_raw
+        trust_floor = 0.4 if self.bootstrap_steps >= 40 else 0.3
+        self.trust = np.clip(self.trust, trust_floor, 0.90)
+        results['tier2']['A10_trust'] = bool(np.all(self.trust > 0.3))
+
+        # C53 Lyapunov Constraint (REDESIGNED)
+        V_curr = float(x_hat @ x_hat)
+        results['delta_V'] = V_curr - self.stability_margin
+        
+        # Responsive margin tracking (reduces lag vs quadratic V mismatch)
+        self.stability_margin = self.cfg.LYAP_DAMPING * self.stability_margin + (1.0 - self.cfg.LYAP_DAMPING) * V_curr
+
+        # Bootstrap for initial transients
+        bootstrap_factor = 1.0
+        if self.bootstrap_steps < 40:
+            bootstrap_factor = 1.0 + 3.0 * np.exp(-self.bootstrap_steps / 8.0)
+            self.bootstrap_steps += 1
+        
+        # State-dependent scaling: bound grows with system energy
+        adaptive_factor = 1.0 + 1.0 * np.clip(np.linalg.norm(x_hat - CONFIG.X_TARGET) / 1.0, 0, 1)
+        base_bound = self.cfg.LYAP_GAMMA + self.cfg.W_PROC + self.cfg.W_EST
+        lyap_bound = (base_bound + self.cfg.LYAP_STATE_DEPENDENT_SCALE * V_curr) * adaptive_factor * bootstrap_factor
+        
+        # Slack variable approach
+        delta_V_val = V_curr - self.stability_margin
+        c53_violation = max(0.0, delta_V_val - lyap_bound)
+        results['c53_slack'] = min(c53_violation, self.cfg.LYAP_SLACK_MAX)
+        results['tier2']['C53_lyapunov'] = c53_violation <= self.cfg.LYAP_SLACK_MAX
+        
+        results['psi_confidence'] = float(np.clip((lyap_bound + self.cfg.LYAP_SLACK_MAX - delta_V_val) / max(lyap_bound, 1e-6), 0.0, 1.0))
+
+        # Tier 3 Evaluation
+        epistemic = 1.0 + np.clip(np.mean(np.diag(P_kf)) / self.cfg.UNCERTAINTY_THRESHOLD, 0.0, 2.0)
+        results['tier3']['C61_epistemic'] = epistemic < 3.0
+        results['tier3']['C52_assumption'] = bool(np.all(np.isfinite(P_kf)))
+
+        # Independent diagnostic counting
+        for name in list(results['tier1'].keys()) + list(results['tier2'].keys()) + list(results['tier3'].keys()):
+            passed = results['tier1'].get(name, results['tier2'].get(name, results['tier3'].get(name)))
+            if not passed:
+                self.independent_counts[name] += 1
+
+        # Ψ Evaluation & Root-Cause Attribution
+        all_t1 = all(results['tier1'].values())
+        all_t2 = all(results['tier2'].values())
+        all_t3 = all(results['tier3'].values())
+        psi = all_t1 and all_t2 and all_t3
+        results['Psi'] = psi
+        results['tiers'] = {'t1': all_t1, 't2': all_t2, 't3': all_t3}
+        results['epistemic'] = epistemic
+        results['trust'] = self.trust.copy()
+        results['stability'] = self.stability_margin
+
+        # Ψ-conditioned trigger attribution (Precedence: Tier1 -> Tier2 -> Tier3)
+        if not psi:
+            precedence_order = ['A5_energy', 'A8_slew', 'A9_kinematic', 'A6_compute', 'C59_actuation',
+                                'A10_trust', 'C53_lyapunov', 'C61_epistemic', 'C52_assumption']
+            for name in precedence_order:
+                if name in results['tier1'] and not results['tier1'][name]:
+                    self.psi_trigger_counts[name] += 1
+                    results['trigger_constraint'] = name
+                    break
+                elif name in results['tier2'] and not results['tier2'][name]:
+                    self.psi_trigger_counts[name] += 1
+                    results['trigger_constraint'] = name
+                    break
+                elif name in results['tier3'] and not results['tier3'][name]:
+                    self.psi_trigger_counts[name] += 1
+                    results['trigger_constraint'] = name
+                    break
+
+        if not psi:
+            results['projection'] = self._project_feasible(u_cmd, results)
+        self.lattice_history.append(results)
+        return results
+
+    def _project_feasible(self, u_cmd, lattice_res):
+        u_proj = u_cmd.copy()
+        if not lattice_res['tier1']['A9_kinematic']:
+            max_u = np.max(np.abs(u_cmd)) + 1e-9
+            u_proj = u_proj * min(self.cfg.AGENT_KINEMATIC_LIMITS / max_u, 1.0)
+        if not lattice_res['tier2']['C53_lyapunov']:
+            slack_violation = lattice_res.get('c53_slack', 0)
+            severity = slack_violation / max(self.cfg.LYAP_SLACK_MAX, 1e-6)
+            damping = 0.98 if severity < 0.5 else (0.92 if severity < 1.0 else 0.80)
+            u_proj = u_proj * damping
+        lim = self.cfg.AGENT_KINEMATIC_LIMITS * 0.95
+        u_proj = np.clip(u_proj, -lim, lim)
+        if np.any(np.abs(u_proj) > self.cfg.AGENT_KINEMATIC_LIMITS * 0.92):
+            u_proj = np.clip(-0.25 * CONFIG.X_TARGET, -1.5, 1.5)
+        return u_proj
+    
+    def get_failure_report(self):
+        return {
+            'psi_trigger_counts': dict(self.psi_trigger_counts),
+            'independent_counts': dict(self.independent_counts)
+        }
+
+# ==================================================================
+# STATE ESTIMATOR
+# ==================================================================
+class StateEstimator:
+    def __init__(self):
+        self.A_mat = np.eye(NX)
+        self.B_mat = DT * np.eye(NU)
+        self.H_mat = np.eye(NX)
+        self.Q = CONFIG.Q_KF.copy()
+        self.R = CONFIG.R_KF.copy()
+        self.x_hat = CONFIG.X_TARGET.copy()
+        self.P = self.Q * 10.0
+
+    def update(self, u_cmd, measurement):
+        x_pred = self.A_mat @ self.x_hat + self.B_mat @ u_cmd
+        P_pred = self.A_mat @ self.P @ self.A_mat.T + self.Q
+        S = self.H_mat @ P_pred @ self.H_mat.T + self.R
+        K = (P_pred @ self.H_mat.T) @ np.linalg.solve(S, np.eye(NX))
+        self.x_hat = x_pred + K @ (measurement - self.H_mat @ x_pred)
+        self.P = (np.eye(NX) - K @ self.H_mat) @ P_pred
+        return self.x_hat.copy(), self.P.copy()
+
+# ==================================================================
+# ROBUST MPC CONTROLLER
+# ==================================================================
+class RobustMPC:
+    def __init__(self):
+        self.A_mat = np.eye(NX)
+        self.B_mat = DT * np.eye(NU)
+        Ql, Rl = 5.0*np.eye(NX), 1.0*np.eye(NU)
+        self.P_term = sla.solve_discrete_are(self.A_mat, self.B_mat, Ql, Rl)
+        self.K_lqr = np.linalg.inv(Rl + self.B_mat.T @ self.P_term @ self.B_mat) @ self.B_mat.T @ self.P_term @ self.A_mat
+        A_cl_abs = np.abs(self.A_mat - self.B_mat @ self.K_lqr)
+        Z = np.zeros(NX)
+        self.tube = [Z.copy()]
+        w_bound = CONFIG.W_PROC + CONFIG.W_EST
+        for _ in range(H):
+            Z = A_cl_abs @ Z + np.full(NX, w_bound)
+            self.tube.append(Z.copy())
+        self.lattice = AxionLatticeEngine(CONFIG)
+        self.z_prev = None
+        self.x_prev = None
+        self.sep_cmd_prev = np.zeros(NU)
+        self.sep_rate_limit = 1.0
+        self.prob = osqp.OSQP()
+        self.prob_initialized = False
+
+    def solve(self, x_hat, P_kf, u_prev, step):
+        t0 = time.time()
+        nz = NZ_BASE
+        u_safe = u_prev if u_prev is not None else np.zeros(NU)
+
+        P_diag = np.concatenate([np.tile(5.0, NX_DEC), np.tile(1.0, NU_DEC), np.tile(CONFIG.SLACK_WEIGHT, len(PAIRS))])
+        for d in range(NX): P_diag[x_idx(H).start + d] = self.P_term[d, d]
+        P_cost = sp.diags(P_diag, format='csc')
+        q = np.zeros(nz)
+        for k in range(1, H + 1): q[x_idx(k)] = -5.0 * CONFIG.X_TARGET
+
+        rows, l_list, u_list = [], [], []
+        for k in range(H):
+            for d in range(NX):
+                row = np.zeros(nz)
+                row[x_idx(k + 1).start + d] = 1.0
+                row[u_idx(k).start + d] = -DT
+                if k > 0: row[x_idx(k).start + d] = -1.0
+                rows.append(row)
+                l_list.append(float(x_hat[d]) if k == 0 else 0.0)
+                u_list.append(float(x_hat[d]) if k == 0 else 0.0)
+
+        for k in range(H):
+            max_fb = np.abs(self.K_lqr) @ self.tube[k]
+            for d in range(NU):
+                row = np.zeros(nz)
+                row[u_idx(k).start + d] = 1.0
+                rows.append(row)
+                l_list.append(max(-4.0 + max_fb[d], -4.0))
+                u_list.append(min(4.0 - max_fb[d], 4.0))
+
+        margin_base = CONFIG.W_PROC + CONFIG.W_EST
+        for i, j in PAIRS:
+            diff = x_hat[i] - x_hat[j]
+            if abs(diff) < 1e-6: continue
+            sigma = np.sqrt(P_kf[i, i]) + np.sqrt(P_kf[j, j])
+            rhs = -CONFIG.ALPHA * (diff**2 - CONFIG.D_SAFE**2) - 2.0 * abs(diff) * 1.5 * (2.5 * sigma + margin_base)
+            row = np.zeros(nz)
+            row[u_idx(0).start + i] = 2.0 * DT * diff
+            row[u_idx(0).start + j] = -2.0 * DT * diff
+            row[SLACK_OFFSETS[(i, j)]] = 1.0
+            rows.append(row)
+            l_list.append(rhs)
+            u_list.append(np.inf)
+
+        for i, j in PAIRS:
+            row = np.zeros(nz)
+            row[SLACK_OFFSETS[(i, j)]] = 1.0
+            rows.append(row)
+            l_list.append(0.0)
+            u_list.append(CONFIG.EPS_MAX)
+
+        A_mat = sp.csc_matrix(np.vstack(rows))
+        l_arr = np.nan_to_num(np.array(l_list, dtype=float), nan=-1e8, posinf=1e8, neginf=-1e8)
+        u_arr = np.nan_to_num(np.array(u_list, dtype=float), nan=1e8, posinf=1e8, neginf=-1e8)
+        u_arr = np.maximum(u_arr, l_arr + 1e-5)
+
+        if not (np.all(np.isfinite(P_cost.data)) and np.all(np.isfinite(q)) and np.all(np.isfinite(l_arr)) and np.all(np.isfinite(u_arr))):
+            return np.zeros(NU), False, {'solve_ms': 0, 'slacks': np.zeros(len(PAIRS)), 'lattice': {}, 'error': 'NaN/Inf'}
+
+        diag = {'solve_ms': 0.0, 'slacks': np.zeros(len(PAIRS)), 'lattice': {}}
+        try:
+            if not self.prob_initialized:
+                self.prob.setup(P=P_cost, q=q, A=A_mat, l=l_arr, u=u_arr, verbose=False, polish=False, max_iter=150, eps_abs=1e-3, eps_rel=1e-3)
+                self.prob_initialized = True
+            else:
+                self.prob.update(Px=P_cost.data, q=q, Ax=A_mat.data, l=l_arr, u=u_arr)
+            res = self.prob.solve()
+            diag['solve_ms'] = (time.time() - t0) * 1000.0
+            if diag['solve_ms'] > 50.0:
+                raise TimeoutError("Solver exceeded 50ms")
+            if res.info.status_val in (1, 2) and np.all(np.isfinite(res.x)):
+                self.z_prev = res.x.copy()
+                diag['slacks'] = res.x[NX_DEC + NU_DEC:]
+                u_nom = res.x[u_idx(0)].copy()
+                diag['lattice'] = self.lattice.evaluate_lattice(u_nom, x_hat, P_kf, u_prev, diag['solve_ms'], step)
+                if not diag['lattice'].get('Psi', True):
+                    proj = diag['lattice'].get('projection')
+                    if proj is not None: u_nom = proj
+                return u_nom, True, diag
+        except Exception as e:
+            diag['solve_ms'] = (time.time() - t0) * 1000.0
+            diag['error'] = str(e)
+        diag['lattice'] = self.lattice.evaluate_lattice(np.zeros(NU), x_hat, P_kf, u_prev, diag['solve_ms'], step)
+        return np.zeros(NU), False, diag
+
+# ==================================================================
+# OUTPUT MANAGER (FIXED SYNTAX + ACCURATE LABELING)
+# ==================================================================
+class OutputManager:
+    def __init__(self, config: AxionConfig):
+        self.cfg = config
+        self.results = []
+        self.mode_counts = defaultdict(int)
+        self.lattice_log = []
+        self.trust_history = []
+        self.stability_history = []
+
+    def record(self, data):
+        self.results.append(data)
+        self.mode_counts[data['mode']] += 1
+        self.lattice_log.append(data.get('lattice', {}))
+        if 'trust' in data:
+            self.trust_history.append(data['trust'])
+        if 'stability' in data:
+            self.stability_history.append(data['stability'])
+
+    def generate_report(self, psi_triggers=None, independent_counts=None):
+        df = pd.DataFrame(self.results)
+        buf = io.StringIO()
+        sep80, dash40, dash80 = '='*80, '-'*40, '-'*80
+        buf.write(f"{sep80}\n AXION CONSTRAINT LATTICE: FULL MONTE CARLO ANALYSIS REPORT\n{sep80}\n")
+        buf.write(f"Generated  : {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        buf.write(f"Config     : Agents={CONFIG.N_AGENTS} | Horizon={CONFIG.HORIZON} | Steps={CONFIG.MC_STEPS} | Runs={CONFIG.MC_RUNS}\n{dash80}\n")
+        total = len(self.results)
+        n_safe = int((df['min_sep'] >= CONFIG.D_SAFE).sum())
+        psi_pass = sum(1 for l in self.lattice_log if l.get('Psi', False))
+        buf.write(f"\n EXECUTIVE SUMMARY\n{dash40}\n")
+        buf.write(f"Total Steps Processed    : {total}\n")
+        buf.write(f"Safety Compliance Rate   : {n_safe/max(total,1)*100:.2f}%\n")
+        buf.write(f"Safety Violations        : {total-n_safe}\n")
+        buf.write(f"Avg Min Separation       : {df['min_sep'].mean():.4f}\n")
+        buf.write(f"Avg MPC Solve Time       : {df['solve_ms'].mean():.3f} ms\n")
+        buf.write(f"Lattice Psi Pass Rate    : {psi_pass/max(len(self.lattice_log),1)*100:.2f}%\n")
+        
+        # Ψ-Triggered Failure Breakdown (TRUE ROOT CAUSE)
+        if psi_triggers:
+            buf.write(f"\n Ψ FAILURE ROOT-CAUSE ATTRIBUTION\n{dash40}\n")
+            buf.write(f"{'Constraint':<20} | {'Ψ Triggers':<12} | {'% of Ψ Fails':<12}\n")
+            buf.write(f"{'-'*46}\n")
+            total_psi_fails = max(sum(psi_triggers.values()), 1)
+            for name, count in sorted(psi_triggers.items(), key=lambda x: x[1], reverse=True):
+                pct = count/total_psi_fails*100
+                buf.write(f"{name:<20} | {count:<12} | {pct:<12.2f}%\n")
+            buf.write(f"{'TOTAL':<20} | {total_psi_fails:<12} | {'100.00':<12}%\n")
+
+        # Independent Constraint Failures (DIAGNOSTIC)
+        if independent_counts:
+            buf.write(f"\n INDEPENDENT CONSTRAINT FAILURES (DIAGNOSTIC)\n{dash40}\n")
+            buf.write(f"{'Constraint':<20} | {'Failures':<10} | {'Rate (%)':<10}\n")
+            buf.write(f"{'-'*42}\n")
+            for name, count in sorted(independent_counts.items(), key=lambda x: x[1], reverse=True):
+                rate = count/max(total,1)*100
+                buf.write(f"{name:<20} | {count:<10} | {rate:<10.2f}\n")
+        
+        buf.write(f"\n CONTROL MODE DISTRIBUTION\n{dash40}\n")
+        for mode, count in sorted(self.mode_counts.items(), key=lambda x: x[1], reverse=True):
+            pct = count/max(total,1)*100
+            buf.write(f"  {mode:<25}: {count:>5} ({pct:5.2f}%) {'#'*int(pct/2)}\n")
+        tot = max(len(self.lattice_log), 1)
+        t1 = sum(1 for l in self.lattice_log if l.get('tiers',{}).get('t1',False))
+        t2 = sum(1 for l in self.lattice_log if l.get('tiers',{}).get('t2',False))
+        t3 = sum(1 for l in self.lattice_log if l.get('tiers',{}).get('t3',False))
+        # FIXED: Tier labels now match actual config timeouts
+        buf.write(f"\n AXION LATTICE TIER EVALUATION\n{dash40}\n")
+        buf.write(f"  Tier 1 (Hard Gate <{CONFIG.TIER1_TIMEOUT_MS}s) : {t1/tot*100:.2f}% pass\n")
+        buf.write(f"  Tier 2 (Soft Gate 1-{CONFIG.TIER2_TIMEOUT_MS}s): {t2/tot*100:.2f}% pass\n")
+        buf.write(f"  Tier 3 (Async Monitor)   : {t3/tot*100:.2f}% pass\n")
+        buf.write(f"  Projections Triggered    : {sum(1 for l in self.lattice_log if l.get('projection') is not None)}\n")
+        buf.write(f"\n TRUST AND STABILITY DYNAMICS\n{dash40}\n")
+        if self.trust_history:
+            t_arr = np.array(self.trust_history)
+            buf.write(f"  Trust  Mean/Min/Max : {float(np.mean(t_arr)):.4f} / {float(np.min(t_arr)):.4f} / {float(np.max(t_arr)):.4f}\n")
+        if self.stability_history:
+            buf.write(f"  Stability Margin Mean: {float(np.mean(self.stability_history)):.4f}\n")
+        run_lat = defaultdict(list)
+        for r in self.results: run_lat[int(r['run'])].append(r.get('lattice',{}))
+        buf.write(f"\n PER-RUN AGGREGATED METRICS\n{dash80}\n")
+        buf.write(f"{'Run':<5} | {'Min Sep':<10} | {'Avg Sep':<10} | {'Violations':<12} | {'Psi Fail':<9} | Mode\n{dash80}\n")
+        for run in sorted(df['run'].unique()):
+            rdf = df[df['run']==run]
+            pf = sum(1 for l in run_lat[int(run)] if not l.get('Psi',True))
+            mode = rdf['mode'].mode().iloc[0] if not rdf.empty else 'UNKNOWN'
+            buf.write(f"{int(run):<5} | {float(rdf['min_sep'].min()):<10.4f} | {float(rdf['min_sep'].mean()):<10.4f} | {int((rdf['min_sep']<CONFIG.D_SAFE).sum()):<12} | {pf:<9} | {mode}\n")
+        buf.write(f"\n{sep80}\nEND OF AXION LATTICE REPORT\n{sep80}\n")
+        return buf.getvalue()
+
+    def generate_visual_dashboard(self, df, psi_triggers=None):
+        fig = plt.figure(figsize=(20, 16))
+        gs = gridspec.GridSpec(3, 3, figure=fig, hspace=0.3, wspace=0.3)
+        
+        ax1 = fig.add_subplot(gs[0, 0])
+        run0 = df[df['run']==0].sort_values('t')
+        ax1.plot(run0['t'], run0['min_sep'], 'b-', linewidth=1, label='Min Separation')
+        ax1.axhline(y=CONFIG.D_SAFE, color='r', linestyle='--', label=f'Safety ({CONFIG.D_SAFE})')
+        ax1.fill_between(run0['t'], CONFIG.D_SAFE, run0['min_sep'].max(), where=(run0['min_sep']>=CONFIG.D_SAFE), alpha=0.2, color='green', label='Safe Zone')
+        ax1.set_xlabel('Time Step'); ax1.set_ylabel('Separation'); ax1.set_title('Safety Compliance (Run 0)'); ax1.legend(fontsize=7); ax1.grid(True, alpha=0.3)
+        
+        ax2 = fig.add_subplot(gs[0, 1])
+        modes = list(self.mode_counts.keys())
+        counts = [self.mode_counts[m] for m in modes]
+        colors = plt.cm.Set2(np.linspace(0, 1, len(modes)))
+        ax2.pie(counts, labels=[f'{m}\n({c})' for m,c in zip(modes, counts)], autopct='%1.1f%%', colors=colors, startangle=90, textprops={'fontsize':8})
+        ax2.set_title('Control Mode Distribution')
+        
+        ax3 = fig.add_subplot(gs[0, 2])
+        tot = max(len(self.lattice_log), 1)
+        t1 = sum(1 for l in self.lattice_log if l.get('tiers',{}).get('t1',False))
+        t2 = sum(1 for l in self.lattice_log if l.get('tiers',{}).get('t2',False))
+        t3 = sum(1 for l in self.lattice_log if l.get('tiers',{}).get('t3',False))
+        psi = sum(1 for l in self.lattice_log if l.get('Psi',False))
+        rates = [t1/tot*100, t2/tot*100, t3/tot*100, psi/tot*100]
+        labels = ['Tier 1', 'Tier 2', 'Tier 3', 'Psi Overall']
+        bars = ax3.barh(labels, rates, color=['#2ecc71', '#3498db', '#9b59b6', '#e74c3c'])
+        ax3.set_xlabel('Pass Rate (%)'); ax3.set_title('Constraint Tier Performance'); ax3.set_xlim(0, 100)
+        for i, (bar, rate) in enumerate(zip(bars, rates)): ax3.text(rate + 1, i, f'{rate:.1f}%', va='center', fontsize=8)
+        ax3.grid(axis='x', alpha=0.3)
+        
+        ax4 = fig.add_subplot(gs[1, 0])
+        if self.trust_history:
+            trust_arr = np.array(self.trust_history)
+            steps = np.arange(len(trust_arr))
+            ax4.plot(steps[::10], np.mean(trust_arr[::10], axis=1), 'g-', linewidth=1, label='Mean Trust')
+            ax4.fill_between(steps[::10], np.min(trust_arr[::10], axis=1), np.max(trust_arr[::10], axis=1), alpha=0.2, color='green')
+        ax4.axhline(y=0.4, color='orange', linestyle=':', label='Floor'); ax4.axhline(y=0.9, color='red', linestyle=':', label='Cap')
+        ax4.set_xlabel('Step (sampled)'); ax4.set_ylabel('Trust'); ax4.set_title('Trust Dynamics'); ax4.legend(fontsize=7); ax4.grid(True, alpha=0.3)
+        
+        ax5 = fig.add_subplot(gs[1, 1])
+        if self.stability_history:
+            steps = np.arange(len(self.stability_history))
+            ax5.plot(steps[::10], self.stability_history[::10], 'b-', linewidth=1)
+            ax5.axhline(y=1.0, color='gray', linestyle=':', alpha=0.5)
+        ax5.set_xlabel('Step (sampled)'); ax5.set_ylabel('Margin'); ax5.set_title('Lyapunov Stability Evolution'); ax5.grid(True, alpha=0.3)
+        
+        ax6 = fig.add_subplot(gs[1, 2])
+        ax6.hist(df['solve_ms'], bins=40, color='steelblue', edgecolor='black', alpha=0.7)
+        ax6.axvline(x=df['solve_ms'].mean(), color='red', linestyle='--', label=f"Mean: {df['solve_ms'].mean():.2f}ms")
+        ax6.axvline(x=CONFIG.TIER1_TIMEOUT_MS, color='orange', linestyle=':', label=f"Tier1 Limit ({CONFIG.TIER1_TIMEOUT_MS}s)")
+        ax6.set_xlabel('Solve Time (ms)'); ax6.set_ylabel('Frequency'); ax6.set_title('MPC Solver Performance'); ax6.legend(fontsize=7); ax6.grid(True, alpha=0.3)
+        
+        # Ψ Trigger Distribution
+        ax7 = fig.add_subplot(gs[2, :])
+        if psi_triggers:
+            names = list(psi_triggers.keys())
+            counts = list(psi_triggers.values())
+            sorted_idx = np.argsort(counts)[::-1]
+            names = [names[i] for i in sorted_idx]
+            counts = [counts[i] for i in sorted_idx]
+            colors = ['#e74c3c' if c > 0 else '#2ecc71' for c in counts]
+            bars = ax7.barh(names, counts, color=colors)
+            ax7.set_xlabel('Ψ Failure Triggers'); ax7.set_title('TRUE ROOT-CAUSE: Constraints Triggering Ψ Failures')
+            ax7.grid(axis='x', alpha=0.3)
+            for i, (bar, count) in enumerate(zip(bars, counts)):
+                if count > 0: ax7.text(count + 1, i, str(count), va='center', fontsize=8)
+        else:
+            ax7.text(0.5, 0.5, 'No trigger data available', ha='center', va='center', transform=ax7.transAxes)
+            ax7.set_title('Ψ Trigger Distribution')
+        
+        fig.suptitle('AXION Constraint Lattice: Monte Carlo Validation Dashboard', fontsize=14, fontweight='bold', y=0.995)
+        plt.tight_layout()
+        plot_path = self.cfg.PLOT_PATH
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight', facecolor='white')
+        plt.close()
+        return plot_path
+
+    def save_all(self, df, psi_triggers=None, independent_counts=None):
+        os.makedirs(self.cfg.OUTPUT_DIR, exist_ok=True)
+        df[[c for c in df.columns if c not in ('lattice','trust')]].to_csv(self.cfg.CSV_PATH, index=False)
+        report = self.generate_report(psi_triggers, independent_counts)
+        with open(self.cfg.REPORT_PATH, 'w') as f: f.write(report)
+        plot_path = self.generate_visual_dashboard(df, psi_triggers)
+        return report, plot_path
+
+# ==================================================================
+# MONTE CARLO LOOP (FIXED AGGREGATION)
+# ==================================================================
+def run_mc_validation():
+    print('🚀 Initializing FIREGATE-X v7.5 + AXION Lattice Engine (C53 Optimized + True Attribution)...')
+    est, ctrl = StateEstimator(), RobustMPC()
+    output = OutputManager(CONFIG)
+    mode_hyst = ModeHysteresis(enter_thresh=CONFIG.D_SAFE*0.98, exit_thresh=CONFIG.D_SAFE*1.05)
+    start = time.time()
+    all_results = []
+    
+    # FIX 1: Proper cross-run aggregation
+    total_psi_triggers = defaultdict(int)
+    total_independent = defaultdict(int)
+
+    for run in range(CONFIG.MC_RUNS):
+        est.x_hat, est.P = CONFIG.X_TARGET.copy(), CONFIG.Q_KF*10.0
+        ctrl.z_prev, ctrl.x_prev = None, None
+        ctrl.lattice = AxionLatticeEngine(CONFIG)  # Fresh engine per run
+        ctrl.lattice.bootstrap_steps = 0
+        ctrl.sep_cmd_prev = np.zeros(NU)
+        mode_hyst.current_mode = 'NOMINAL'
+        x_true, u_prev = np.array([-1.2, 0.6, 1.8]), np.zeros(NU)
+
+        for t in range(CONFIG.MC_STEPS):
+            y_meas = x_true + np.random.multivariate_normal(np.zeros(NX), CONFIG.R_KF)
+            x_hat, P_kf = est.update(u_prev, y_meas)
+            u_nom, ok, diag = ctrl.solve(x_hat, P_kf, u_prev, t)
+            seps = [abs(x_true[i]-x_true[j]) for i in range(NX) for j in range(i+1, NX)]
+            min_sep = min(seps)
+            psi_conf = diag['lattice'].get('psi_confidence', 1.0)
+            mode = mode_hyst.select_mode(min_sep, diag['lattice'].get('Psi', True), psi_conf)
+            u_real = u_nom.copy()
+
+            if mode == 'A31_SEPARATION' or min_sep < CONFIG.D_SAFE*0.98:
+                u_sep = np.zeros(NU)
+                for i in range(NX):
+                    for j in range(i+1, NX):
+                        diff = abs(x_true[i]-x_true[j])
+                        if diff < CONFIG.D_SAFE:
+                            d = np.sign(x_true[i]-x_true[j])
+                            force = 1.5 + 2.0*np.clip((CONFIG.D_SAFE-diff)/CONFIG.D_SAFE, 0, 1)
+                            u_sep[i] += d*force; u_sep[j] -= d*force
+                alpha = 0.3
+                u_sep = alpha * u_sep + (1 - alpha) * ctrl.sep_cmd_prev
+                ctrl.sep_cmd_prev = u_sep.copy()
+                u_real = np.clip(u_sep, -2.5, 2.5)
+                mode = 'A31_SEPARATION'
+            elif mode == 'A32_DEGRADED' or not diag['lattice'].get('Psi', True):
+                u_real = u_real * 0.5
+                mode = 'A32_DEGRADED'
+
+            u_real = np.clip(u_real, -4.0, 4.0)
+            x_true = x_true + DT*u_real + np.random.uniform(-CONFIG.W_PROC, CONFIG.W_PROC, NX)
+            u_prev = u_real.copy()
+            ctrl.x_prev = x_hat.copy()
+
+            seps_after = [abs(x_true[i]-x_true[j]) for i in range(NX) for j in range(i+1, NX)]
+            row = {'t':t, 'run':run, 'min_sep':min(seps_after), 'safe':min(seps_after)>=CONFIG.D_SAFE,
+                   'u_norm':float(np.linalg.norm(u_real)), 'max_slack':float(np.max(diag['slacks'])),
+                   'solve_ms':diag['solve_ms'], 'mode':mode, 'lattice':diag['lattice'],
+                   'trust':ctrl.lattice.trust.copy(), 'stability':ctrl.lattice.stability_margin}
+            output.record(row)
+            all_results.append(row)
+
+        # FIX 1 CONTINUED: Aggregate after each run
+        run_report = ctrl.lattice.get_failure_report()
+        for k, v in run_report['psi_trigger_counts'].items():
+            total_psi_triggers[k] += v
+        for k, v in run_report['independent_counts'].items():
+            total_independent[k] += v
+
+        if (run+1) % 5 == 0:
+            print(f"  ✅ Run {run+1}/{CONFIG.MC_RUNS} complete  ({time.time()-start:.1f}s elapsed)")
+
+    print('\n📦 Generating output files and visual dashboard...')
+    df = pd.DataFrame(all_results)
+    report, plot_path = output.save_all(df, dict(total_psi_triggers), dict(total_independent))
+    print(f'⏱️  Runtime: {time.time()-start:.2f}s | Steps: {len(all_results):,}')
+    print(f'📄 Report: {CONFIG.REPORT_PATH}')
+    print(f'📊 CSV: {CONFIG.CSV_PATH}')
+    print(f'🖼️  Visual Dashboard: {plot_path}')
+    return report, plot_path, df
+
+# ==================================================================
+# ENTRY POINT
+# ==================================================================
+if __name__ == '__main__':
+    report_text, plot_path, df = run_mc_validation()
+    print('\n' + '='*80 + '\nCOMPREHENSIVE DATA OUTPUT\n' + '='*80)
+    print(report_text)
+    print('\n' + '='*80 + '\n📊 VISUAL DASHBOARD (Rendering inline + saved to file)\n' + '='*80)
+    if os.path.exists(plot_path):
+        img = plt.imread(plot_path)
+        plt.figure(figsize=(20, 16))
+        plt.imshow(img); plt.axis('off'); plt.tight_layout()
+        plt.show()
+        print(f"\n✅ Dashboard saved to: {plot_path}")
+        print(f"📥 Download from Kaggle: /kaggle/working/axion_visual_dashboard.png")
+

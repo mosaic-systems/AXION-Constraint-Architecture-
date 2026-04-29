@@ -9,6 +9,8 @@ Version: 1.0 (Primitives 0–66)
 Classification: Closed Coordination-Complete Constraint Lattice
 Date: April 25, 2026
 Author: Jason.crowe@alumni.com Mosaic Systems Architecture
+link to full experiment:
+https://www.kaggle.com/code/jaydannite/axion-constraint-architecture
 
  EXECUTIVE SUMMARY
 
